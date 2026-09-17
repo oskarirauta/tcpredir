@@ -1,0 +1,16 @@
+# Example /etc/config/tcpredir
+
+config redirect 'web2'
+	option enabled '1'
+	option proto 'tcp'
+	option listen_ip '0.0.0.0'
+	option listen_port '1080'
+	option target_ip '10.0.0.99'
+	option target_port '80'
+
+# UDP is optional; use proto 'udp' or 'both'
+# config redirect 'dns'
+#	option proto 'udp'
+#	option listen_port '1053'
+#	option target_ip '1.1.1.1'
+#	option target_port '53'
