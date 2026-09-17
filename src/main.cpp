@@ -1,8 +1,11 @@
 #include <arpa/inet.h>
-#include <csignal>
+#include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstring>
+#include <fcntl.h>
 #include <iostream>
+#include <memory>
 #include <netdb.h>
 #include <poll.h>
 #include <stdexcept>
@@ -20,11 +23,13 @@
 namespace {
 
 constexpr const char* APP_NAME = "tcpredir";
-constexpr const char* APP_VERSION = "0.1.0";
+constexpr const char* APP_VERSION = "0.2.0";
 constexpr int BUFFER_SIZE = 16384;
-constexpr int UDP_REPLY_TIMEOUT_MS = 5000;
+constexpr int POLL_TICK_MS = 1000;
 
-volatile std::sig_atomic_t running = 1;
+volatile std::sig_atomic_t stop_requested = 0;
+volatile std::sig_atomic_t reload_requested = 0;
+std::atomic<unsigned long> generation{1};
 
 struct redirect_t {
     std::string name;
@@ -35,10 +40,24 @@ struct redirect_t {
     bool tcp = true;
     bool udp = false;
     bool enabled = true;
+    int connect_timeout = 10;
+    int idle_timeout = 300;
+    int udp_timeout = 5;
+    int max_connections = 0; // 0 = unlimited
+    unsigned long generation = 0;
+    std::shared_ptr<std::atomic<int>> active_connections = std::make_shared<std::atomic<int>>(0);
 };
 
-void on_signal(int) {
-    running = 0;
+void on_stop_signal(int) {
+    stop_requested = 1;
+}
+
+void on_reload_signal(int) {
+    reload_requested = 1;
+}
+
+bool should_stop(const redirect_t& r) {
+    return stop_requested || reload_requested || generation.load() != r.generation;
 }
 
 void close_fd(int& fd) {
@@ -48,21 +67,38 @@ void close_fd(int& fd) {
     }
 }
 
-uint16_t parse_port(const std::string& value, const std::string& what) {
+int set_nonblock(int fd, bool enabled) {
+    int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (enabled) flags |= O_NONBLOCK;
+    else flags &= ~O_NONBLOCK;
+    return ::fcntl(fd, F_SETFL, flags);
+}
+
+long parse_long(const std::string& value, const std::string& what, long min, long max) {
     try {
         size_t pos = 0;
-        long p = std::stol(value, &pos, 10);
-        if (pos != value.size() || p < 1 || p > 65535)
-            throw std::out_of_range("port out of range");
-        return static_cast<uint16_t>(p);
+        long n = std::stol(value, &pos, 10);
+        if (pos != value.size() || n < min || n > max)
+            throw std::out_of_range("out of range");
+        return n;
     } catch (const std::exception&) {
         throw std::runtime_error("invalid " + what + ": '" + value + "'");
     }
 }
 
+uint16_t parse_port(const std::string& value, const std::string& what) {
+    return static_cast<uint16_t>(parse_long(value, what, 1, 65535));
+}
+
 std::string opt_string(const UCI::SECTION& section, const std::string& name, const std::string& def = "") {
     if (!section.contains(name)) return def;
     return section[name].to_string();
+}
+
+int opt_int(const UCI::SECTION& section, const std::string& name, int def, int min, int max) {
+    if (!section.contains(name)) return def;
+    return static_cast<int>(parse_long(section[name].to_string(), name, min, max));
 }
 
 bool opt_bool(const UCI::SECTION& section, const std::string& name, bool def) {
@@ -75,7 +111,7 @@ bool opt_bool(const UCI::SECTION& section, const std::string& name, bool def) {
     }
 }
 
-std::vector<redirect_t> load_config(const std::string& config) {
+std::vector<redirect_t> load_config(const std::string& config, unsigned long gen) {
     UCI::PACKAGE pkg(config);
     std::vector<redirect_t> redirects;
 
@@ -84,6 +120,7 @@ std::vector<redirect_t> load_config(const std::string& config) {
 
     for (const auto& section : pkg["redirect"]) {
         redirect_t r;
+        r.generation = gen;
         r.name = section.is_anonymous() ? ("redirect#" + std::to_string(section.index())) : section.name();
         r.enabled = opt_bool(section, "enabled", true);
         if (!r.enabled) continue;
@@ -92,6 +129,10 @@ std::vector<redirect_t> load_config(const std::string& config) {
         r.target_ip = opt_string(section, "target_ip", opt_string(section, "target_addr", ""));
         r.listen_port = parse_port(opt_string(section, "listen_port"), r.name + ".listen_port");
         r.target_port = parse_port(opt_string(section, "target_port"), r.name + ".target_port");
+        r.connect_timeout = opt_int(section, "connect_timeout", 10, 1, 3600);
+        r.idle_timeout = opt_int(section, "idle_timeout", 300, 1, 86400);
+        r.udp_timeout = opt_int(section, "udp_timeout", 5, 1, 3600);
+        r.max_connections = opt_int(section, "max_connections", 0, 0, 1000000);
 
         std::string proto = opt_string(section, "proto", opt_string(section, "protocol", "tcp"));
         for (char& c : proto) c = static_cast<char>(::tolower(c));
@@ -162,7 +203,33 @@ int connect_target(const redirect_t& r, int socktype) {
     for (addrinfo* ai = res; ai; ai = ai->ai_next) {
         fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) { last_error = std::strerror(errno); continue; }
-        if (::connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+
+        if (socktype == SOCK_STREAM) {
+            set_nonblock(fd, true);
+            rc = ::connect(fd, ai->ai_addr, ai->ai_addrlen);
+            if (rc == 0) {
+                set_nonblock(fd, false);
+                break;
+            }
+            if (errno == EINPROGRESS) {
+                pollfd pfd{fd, POLLOUT, 0};
+                rc = ::poll(&pfd, 1, r.connect_timeout * 1000);
+                if (rc > 0 && (pfd.revents & POLLOUT)) {
+                    int err = 0;
+                    socklen_t len = sizeof(err);
+                    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0) {
+                        set_nonblock(fd, false);
+                        break;
+                    }
+                    errno = err;
+                } else if (rc == 0) {
+                    errno = ETIMEDOUT;
+                }
+            }
+        } else if (::connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+            break;
+        }
+
         last_error = std::strerror(errno);
         close_fd(fd);
     }
@@ -187,7 +254,14 @@ bool send_all(int fd, const char* data, ssize_t len) {
     return true;
 }
 
+struct connection_guard {
+    std::shared_ptr<std::atomic<int>> counter;
+    explicit connection_guard(std::shared_ptr<std::atomic<int>> c) : counter(std::move(c)) {}
+    ~connection_guard() { if (counter) --(*counter); }
+};
+
 void proxy_tcp(int client_fd, redirect_t r) {
+    connection_guard guard(r.active_connections);
     int target_fd = -1;
     try {
         target_fd = connect_target(r, SOCK_STREAM);
@@ -195,15 +269,26 @@ void proxy_tcp(int client_fd, redirect_t r) {
 
         pollfd fds[2] = {{client_fd, POLLIN, 0}, {target_fd, POLLIN, 0}};
         char buf[BUFFER_SIZE];
+        const int timeout_ms = std::min(r.idle_timeout * 1000, POLL_TICK_MS);
+        int idle_ticks = 0;
+        const int max_idle_ticks = std::max(1, (r.idle_timeout * 1000 + timeout_ms - 1) / timeout_ms);
 
-        while (running) {
-            int rc = ::poll(fds, 2, -1);
+        while (!should_stop(r)) {
+            int rc = ::poll(fds, 2, timeout_ms);
             if (rc < 0) {
                 if (errno == EINTR) continue;
                 break;
             }
+            if (rc == 0) {
+                if (++idle_ticks >= max_idle_ticks) {
+                    logger::verbose[r.name] << "tcp idle timeout" << std::endl;
+                    break;
+                }
+                continue;
+            }
+            idle_ticks = 0;
             for (int i = 0; i < 2; ++i) {
-                if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) { running = running; goto done; }
+                if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) goto done;
                 if (fds[i].revents & POLLIN) {
                     int in = fds[i].fd;
                     int out = fds[i ^ 1].fd;
@@ -226,21 +311,40 @@ void tcp_listener(redirect_t r) {
     try {
         fd = create_bound_socket(r.listen_ip, r.listen_port, SOCK_STREAM, true);
         logger::notice[r.name] << "tcp listening " << r.listen_ip << ':' << r.listen_port
-                               << " -> " << r.target_ip << ':' << r.target_port << std::endl;
-        while (running) {
+                               << " -> " << r.target_ip << ':' << r.target_port
+                               << " max_connections=" << r.max_connections
+                               << " idle_timeout=" << r.idle_timeout << "s" << std::endl;
+        pollfd pfd{fd, POLLIN, 0};
+        while (!should_stop(r)) {
+            int rc = ::poll(&pfd, 1, POLL_TICK_MS);
+            if (rc < 0) {
+                if (errno == EINTR) continue;
+                if (!should_stop(r)) logger::error[r.name] << "poll: " << std::strerror(errno) << std::endl;
+                continue;
+            }
+            if (rc == 0 || !(pfd.revents & POLLIN)) continue;
+
             sockaddr_storage addr{};
             socklen_t len = sizeof(addr);
             int client = ::accept(fd, reinterpret_cast<sockaddr*>(&addr), &len);
             if (client < 0) {
                 if (errno == EINTR) continue;
-                if (running) logger::error[r.name] << "accept: " << std::strerror(errno) << std::endl;
+                if (!should_stop(r)) logger::error[r.name] << "accept: " << std::strerror(errno) << std::endl;
                 continue;
             }
+
+            int active = r.active_connections->load();
+            if (r.max_connections > 0 && active >= r.max_connections) {
+                logger::warning[r.name] << "connection limit reached (" << r.max_connections << ")" << std::endl;
+                close_fd(client);
+                continue;
+            }
+            ++(*r.active_connections);
             std::thread(proxy_tcp, client, r).detach();
         }
     } catch (const std::exception& e) {
         logger::error[r.name] << e.what() << std::endl;
-        running = 0;
+        stop_requested = 1;
     }
     close_fd(fd);
 }
@@ -253,11 +357,11 @@ void udp_request(int listen_fd, redirect_t r, std::vector<char> data, sockaddr_s
             throw std::runtime_error(std::string("udp send target: ") + std::strerror(errno));
 
         pollfd pfd{target, POLLIN, 0};
-        int rc = ::poll(&pfd, 1, UDP_REPLY_TIMEOUT_MS);
+        int rc = ::poll(&pfd, 1, r.udp_timeout * 1000);
         if (rc > 0 && (pfd.revents & POLLIN)) {
             std::vector<char> reply(65536);
             ssize_t n = ::recv(target, reply.data(), reply.size(), 0);
-            if (n > 0)
+            if (n > 0 && !should_stop(r))
                 ::sendto(listen_fd, reply.data(), static_cast<size_t>(n), MSG_NOSIGNAL,
                          reinterpret_cast<sockaddr*>(&client_addr), client_len);
         }
@@ -272,15 +376,25 @@ void udp_listener(redirect_t r) {
     try {
         fd = create_bound_socket(r.listen_ip, r.listen_port, SOCK_DGRAM, false);
         logger::notice[r.name] << "udp listening " << r.listen_ip << ':' << r.listen_port
-                               << " -> " << r.target_ip << ':' << r.target_port << std::endl;
-        while (running) {
+                               << " -> " << r.target_ip << ':' << r.target_port
+                               << " udp_timeout=" << r.udp_timeout << "s" << std::endl;
+        pollfd pfd{fd, POLLIN, 0};
+        while (!should_stop(r)) {
+            int rc = ::poll(&pfd, 1, POLL_TICK_MS);
+            if (rc < 0) {
+                if (errno == EINTR) continue;
+                if (!should_stop(r)) logger::error[r.name] << "poll: " << std::strerror(errno) << std::endl;
+                continue;
+            }
+            if (rc == 0 || !(pfd.revents & POLLIN)) continue;
+
             std::vector<char> buf(65536);
             sockaddr_storage client_addr{};
             socklen_t client_len = sizeof(client_addr);
             ssize_t n = ::recvfrom(fd, buf.data(), buf.size(), 0, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
             if (n < 0) {
                 if (errno == EINTR) continue;
-                if (running) logger::error[r.name] << "recvfrom: " << std::strerror(errno) << std::endl;
+                if (!should_stop(r)) logger::error[r.name] << "recvfrom: " << std::strerror(errno) << std::endl;
                 continue;
             }
             buf.resize(static_cast<size_t>(n));
@@ -288,9 +402,26 @@ void udp_listener(redirect_t r) {
         }
     } catch (const std::exception& e) {
         logger::error[r.name] << e.what() << std::endl;
-        running = 0;
+        stop_requested = 1;
     }
     close_fd(fd);
+}
+
+void run_config(const std::string& config) {
+    unsigned long gen = generation.load();
+    auto redirects = load_config(config, gen);
+    std::vector<std::thread> threads;
+
+    for (const auto& r : redirects) {
+        if (r.tcp) threads.emplace_back(tcp_listener, r);
+        if (r.udp) threads.emplace_back(udp_listener, r);
+    }
+
+    while (!stop_requested && !reload_requested)
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    for (auto& t : threads)
+        if (t.joinable()) t.join();
 }
 
 } // namespace
@@ -330,26 +461,27 @@ int main(int argc, char** argv) {
     logger::prefix = APP_NAME;
     logger::log_level = usage["quiet"] ? logger::error.id() : (usage["verbose"] ? logger::verbose.id() : logger::notice.id());
 
-    std::signal(SIGINT, on_signal);
-    std::signal(SIGTERM, on_signal);
+    std::signal(SIGINT, on_stop_signal);
+    std::signal(SIGTERM, on_stop_signal);
+    std::signal(SIGHUP, on_reload_signal);
     std::signal(SIGPIPE, SIG_IGN);
 
-    try {
-        const std::string config = usage["config"] ? usage["config"].stringValue() : "tcpredir";
-        auto redirects = load_config(config);
-        std::vector<std::thread> threads;
+    const std::string config = usage["config"] ? usage["config"].stringValue() : "tcpredir";
 
-        for (const auto& r : redirects) {
-            if (r.tcp) threads.emplace_back(tcp_listener, r);
-            if (r.udp) threads.emplace_back(udp_listener, r);
+    while (!stop_requested) {
+        try {
+            run_config(config);
+        } catch (const std::exception& e) {
+            logger::error << e.what() << std::endl;
+            return 1;
         }
 
-        for (auto& t : threads)
-            if (t.joinable()) t.join();
-
-    } catch (const std::exception& e) {
-        logger::error << e.what() << std::endl;
-        return 1;
+        if (reload_requested && !stop_requested) {
+            logger::notice << "reloading configuration" << std::endl;
+            reload_requested = 0;
+            generation.fetch_add(1);
+            continue;
+        }
     }
 
     logger::notice << "stopped" << std::endl;

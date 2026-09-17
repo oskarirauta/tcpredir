@@ -8,6 +8,9 @@ TCP on ohjelman ensisijainen käyttötapa. UDP-tuki on mukana yksinkertaisena re
 
 - Useita samanaikaisia `redirect`-sääntöjä samasta UCI-konfiguraatiosta.
 - TCP-tunnelointi molempiin suuntiin.
+- Per-sääntöiset timeoutit ja yhteysmäärän rajoitus.
+- SIGHUP-konfiguraatioreload.
+- OpenWrt `procd` init-skripti.
 - Yksinkertainen UDP request/reply -välitys.
 - IPv4/IPv6-nimiresoluutio `getaddrinfo()`-rajapinnalla.
 - UCI-konfiguraation luku `uci_cpp`-kirjastolla.
@@ -71,6 +74,9 @@ config redirect 'web2'
         option listen_port '1080'
         option target_ip '10.0.0.99'
         option target_port '80'
+        option connect_timeout '10'
+        option idle_timeout '300'
+        option max_connections '128'
 ```
 
 ### Asetukset
@@ -83,6 +89,10 @@ config redirect 'web2'
 | `listen_port` | kyllä | - | Paikallinen kuunteluportti. |
 | `target_ip` / `target_addr` | kyllä | - | Kohdeosoite. |
 | `target_port` | kyllä | - | Kohdeportti. |
+| `connect_timeout` | ei | `10` | TCP-kohdeyhteyden muodostuksen timeout sekunteina. |
+| `idle_timeout` | ei | `300` | TCP-yhteyden inaktiivisuustimeout sekunteina. |
+| `udp_timeout` | ei | `5` | UDP-vastauksen odotusaika sekunteina. |
+| `max_connections` | ei | `0` | Samanaikaisten TCP-yhteyksien raja per sääntö. `0` = ei rajaa. |
 
 Useampi sääntö onnistuu lisäämällä useita `config redirect` -osioita:
 
@@ -110,6 +120,37 @@ config redirect 'dns'
         option target_port '53'
 ```
 
+## Reload
+
+Prosessi lukee konfiguraation uudelleen `SIGHUP`-signaalilla:
+
+```sh
+kill -HUP $(pidof tcpredir)
+```
+
+Reload sulkee kuuntelusocketit ja käynnistää ne uudella konfiguraatiolla. Olemassa olevat yhteydet päättyvät reloadin yhteydessä viimeistään seuraavan poll-herätyksen aikana.
+
+## OpenWrt procd/init
+
+Repossa on esimerkkiscripti [`openwrt.init`](openwrt.init). Se ei ole pakettireseptin korvike, vaan suoraan softan mukana pidettävä ajonaikainen init-esimerkki.
+
+Asennus käsin:
+
+```sh
+cp openwrt.init /etc/init.d/tcpredir
+chmod +x /etc/init.d/tcpredir
+/etc/init.d/tcpredir enable
+/etc/init.d/tcpredir start
+```
+
+Reload OpenWrt:ssä:
+
+```sh
+/etc/init.d/tcpredir reload
+```
+
+`procd` seuraa `/etc/config/tcpredir`-tiedostoa ja reload-trigger on määritelty init-skriptissä.
+
 ## OpenWrt-asennusluonnos
 
 Kopioi binääri ja konfiguraatio laitteelle:
@@ -117,6 +158,7 @@ Kopioi binääri ja konfiguraatio laitteelle:
 ```sh
 scp tcpredir root@router:/usr/sbin/tcpredir
 scp tcpredir.uci.example root@router:/etc/config/tcpredir
+scp openwrt.init root@router:/etc/init.d/tcpredir
 ```
 
 Käynnistys testinä:
@@ -125,24 +167,22 @@ Käynnistys testinä:
 ssh root@router /usr/sbin/tcpredir -c tcpredir
 ```
 
-Varsinainen OpenWrt-paketti ja init-skripti kannattaa lisätä myöhemmin, jos ohjelma halutaan asentaa `opkg`:llä ja hallita `/etc/init.d/tcpredir` kautta.
+OpenWrt-pakettiresepti kuuluu erilliseen pakettirepoon. Tämä repository sisältää vain ohjelman, esimerkkikonfiguraation ja procd-init-skriptin.
 
 ## Rajoitukset
 
 - TCP-yhteydelle luodaan oma säie. Tämä on yksinkertainen ja OpenWrt-käyttöön riittävä lähtökohta, mutta erittäin suurella yhteysmäärällä poll/epoll-pohjainen event loop olisi parempi.
 - UDP-tuki on stateless request/reply -mallinen: jokaiselle datagrammille avataan kohde-socket, odotetaan vastausta hetki ja välitetään vastaus takaisin alkuperäiselle lähettäjälle. Tämä sopii esimerkiksi yksinkertaisiin DNS-tyyppisiin käyttötapauksiin, mutta ei korvaa täyttä UDP-NAT/state-taulua.
-- Ohjelma ei vielä daemonisoi itseään eikä tarjoa pidfileä.
+- Ohjelma ei daemonisoi itseään eikä tarjoa pidfileä. OpenWrt:ssä prosessin valvonta on tarkoitus tehdä `procd`:llä.
 
 ## Kehityssuunnat
 
-Hyödyllisimmät seuraavat lisäykset olisivat:
+Mahdollisia myöhempiä lisäyksiä:
 
-1. OpenWrt-pakettihakemisto ja init-skripti.
-2. Daemon/pidfile-tuki tai procd-integraatio.
-3. Per-sääntöiset timeoutit ja buffer-asetukset.
-4. Yhteysmäärän rajoitus per sääntö.
-5. Parempi UDP-state-taulu, jos UDP:stä halutaan tuotantokelpoinen yleiskäyttöinen tunnelointi.
-6. Automaattiset integraatiotestit Makefileen.
+1. Parempi UDP-state-taulu, jos UDP:stä halutaan tuotantokelpoinen yleiskäyttöinen tunnelointi.
+2. Automaattiset integraatiotestit Makefileen tai erilliseen testiscriptiin.
+3. Bufferikokojen säätö konfiguraatiosta.
+4. Valinnainen käyttäjän vaihto käynnistyksen jälkeen, jos prosessi aloitetaan rootina.
 
 ## Lisenssi
 
