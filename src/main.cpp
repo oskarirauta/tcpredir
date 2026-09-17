@@ -172,9 +172,6 @@ int create_bound_socket(const std::string& ip, uint16_t port, int socktype, bool
 
         int yes = 1;
         ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-#ifdef SO_REUSEPORT
-        ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
-#endif
         if (::bind(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
             if (!listen_socket || ::listen(fd, 128) == 0) break;
         }
