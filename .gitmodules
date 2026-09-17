@@ -1,0 +1,15 @@
+[submodule "uci"]
+	path = uci
+	url = https://github.com/oskarirauta/uci_cpp.git
+[submodule "logger"]
+	path = logger
+	url = https://github.com/oskarirauta/logger_cpp.git
+[submodule "usage"]
+	path = usage
+	url = https://github.com/oskarirauta/usage_cpp.git
+[submodule "netlink"]
+	path = netlink
+	url = https://github.com/oskarirauta/netlink_cpp.git
+[submodule "common"]
+	path = common
+	url = https://github.com/oskarirauta/common_cpp.git
