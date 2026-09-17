@@ -23,7 +23,7 @@
 namespace {
 
 constexpr const char* APP_NAME = "tcpredir";
-constexpr const char* APP_VERSION = "1.0.1";
+constexpr const char* APP_VERSION = "1.1.0";
 constexpr int BUFFER_SIZE = 16384;
 constexpr int POLL_TICK_MS = 1000;
 
@@ -109,6 +109,86 @@ bool opt_bool(const UCI::SECTION& section, const std::string& name, bool def) {
         for (char& c : v) c = static_cast<char>(::tolower(c));
         return v == "1" || v == "true" || v == "yes" || v == "on" || v == "enabled";
     }
+}
+
+// Split on ':' at the top level only, so a bracketed IPv6 literal keeps its
+// colons: "[fd00::1]:80" is two fields, not four.
+std::vector<std::string> split_fields(const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur;
+    int depth = 0;
+    for (char c : s) {
+        if (c == '[') { depth++; continue; }
+        if (c == ']') { if (depth > 0) depth--; continue; }
+        if (c == ':' && depth == 0) { out.push_back(cur); cur.clear(); continue; }
+        cur += c;
+    }
+    out.push_back(cur);
+    return out;
+}
+
+// One command-line redirect spec:
+//
+//   [listen_ip:]listen_port:target_ip:target_port[/proto]
+//
+// listen_ip defaults to 0.0.0.0, proto to tcp. IPv6 literals must be bracketed
+// ([::1]:1080:[fd00::2]:80) so their colons are not read as field separators.
+redirect_t parse_spec(const std::string& spec, size_t index, unsigned long gen,
+                      int connect_timeout, int idle_timeout, int udp_timeout, int max_connections) {
+    redirect_t r;
+    r.generation = gen;
+    r.name = "redirect#" + std::to_string(index);
+    r.connect_timeout = connect_timeout;
+    r.idle_timeout = idle_timeout;
+    r.udp_timeout = udp_timeout;
+    r.max_connections = max_connections;
+
+    std::string body = spec;
+    std::string::size_type slash = body.rfind('/');
+    if (slash != std::string::npos) {
+        std::string proto = body.substr(slash + 1);
+        body = body.substr(0, slash);
+        for (char& c : proto) c = static_cast<char>(::tolower(c));
+        if (proto == "tcp") { r.tcp = true; r.udp = false; }
+        else if (proto == "udp") { r.tcp = false; r.udp = true; }
+        else if (proto == "both" || proto == "tcpudp" || proto == "tcp+udp") { r.tcp = true; r.udp = true; }
+        else throw std::runtime_error("invalid protocol in '" + spec + "': " + proto);
+    }
+
+    std::vector<std::string> f = split_fields(body);
+    if (f.size() == 4) {
+        r.listen_ip = f[0];
+        r.listen_port = parse_port(f[1], "listen_port");
+        r.target_ip = f[2];
+        r.target_port = parse_port(f[3], "target_port");
+    } else if (f.size() == 3) {
+        r.listen_port = parse_port(f[0], "listen_port");
+        r.target_ip = f[1];
+        r.target_port = parse_port(f[2], "target_port");
+    } else {
+        throw std::runtime_error("malformed redirect '" + spec +
+                                 "': expected [listen_ip:]listen_port:target_ip:target_port[/proto]");
+    }
+
+    if (r.listen_ip.empty()) r.listen_ip = "0.0.0.0";
+    if (r.target_ip.empty())
+        throw std::runtime_error("missing target address in '" + spec + "'");
+
+    // a name that reads well in the log: "1080->10.102.2.2:80"
+    r.name = std::to_string(r.listen_port) + "->" + r.target_ip + ":" + std::to_string(r.target_port);
+    return r;
+}
+
+// Redirects given on the command line instead of in a UCI file. This is what a
+// supervisor (uxcd) uses: it knows the container's address and the port to
+// publish, and spawning `tcpredir 1080:10.102.2.2:80` needs no generated config
+// file that two programs would then both own.
+std::vector<redirect_t> load_specs(const std::vector<std::string>& specs, unsigned long gen,
+                                   int connect_timeout, int idle_timeout, int udp_timeout, int max_connections) {
+    std::vector<redirect_t> redirects;
+    for (size_t i = 0; i < specs.size(); i++)
+        redirects.push_back(parse_spec(specs[i], i, gen, connect_timeout, idle_timeout, udp_timeout, max_connections));
+    return redirects;
 }
 
 std::vector<redirect_t> load_config(const std::string& config, unsigned long gen) {
@@ -404,9 +484,7 @@ void udp_listener(redirect_t r) {
     close_fd(fd);
 }
 
-void run_config(const std::string& config) {
-    unsigned long gen = generation.load();
-    auto redirects = load_config(config, gen);
+void run_redirects(std::vector<redirect_t> redirects) {
     std::vector<std::thread> threads;
 
     for (const auto& r : redirects) {
@@ -421,6 +499,14 @@ void run_config(const std::string& config) {
         if (t.joinable()) t.join();
 }
 
+void run_config(const std::string& config) {
+    unsigned long gen = generation.load();
+    auto redirects = load_config(config, gen);
+    if (redirects.empty())
+        throw std::runtime_error("no enabled redirects");
+    run_redirects(std::move(redirects));
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -430,11 +516,17 @@ int main(int argc, char** argv) {
             .name = APP_NAME,
             .version = APP_VERSION,
             .author = "Oskari Rauta / OpenAI Codex",
-            .usage = "[options]",
-            .description = "Simple TCP/UDP redirector using OpenWrt UCI style config."
+            .usage = "[options] [<redirect>...]",
+            .description = "Simple TCP/UDP redirector. Redirects come from an OpenWrt UCI config, or\n"
+                           "directly from the command line as [listen_ip:]listen_port:target_ip:target_port[/proto]\n"
+                           "(e.g. 1080:10.102.2.2:80). Command-line redirects replace the config file."
         },
         .options = {
             { "config",  { .key = "c", .word = "config",  .desc = "UCI config name or path (default: tcpredir)", .flag = usage_t::REQUIRED, .name = "file" }},
+            { "connect-timeout", { .word = "connect-timeout", .desc = "command-line redirects: connect timeout, seconds (default 10)", .flag = usage_t::REQUIRED, .name = "sec", .type = usage_t::INT }},
+            { "idle-timeout",    { .word = "idle-timeout",    .desc = "command-line redirects: idle timeout, seconds (default 300)", .flag = usage_t::REQUIRED, .name = "sec", .type = usage_t::INT }},
+            { "udp-timeout",     { .word = "udp-timeout",     .desc = "command-line redirects: udp reply timeout, seconds (default 5)", .flag = usage_t::REQUIRED, .name = "sec", .type = usage_t::INT }},
+            { "max-connections", { .word = "max-connections", .desc = "command-line redirects: concurrent connections, 0 = unlimited", .flag = usage_t::REQUIRED, .name = "n", .type = usage_t::INT }},
             { "verbose", { .key = "V", .word = "verbose", .desc = "verbose logging" }},
             { "quiet",   { .key = "q", .word = "quiet",   .desc = "only errors" }},
             { "help",    { .key = "h", .word = "help",    .desc = "show help" }},
@@ -443,7 +535,7 @@ int main(int argc, char** argv) {
     };
 
     if (usage["help"]) {
-        std::cout << usage << std::endl;
+        std::cout << usage << std::endl << usage.help() << std::endl;
         return 0;
     }
     if (usage["version"]) {
@@ -451,7 +543,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (!usage.errors().empty()) {
-        std::cerr << usage.errors() << std::endl << usage << std::endl;
+        std::cerr << usage.errors() << std::endl << usage << std::endl << usage.help() << std::endl;
         return 2;
     }
 
@@ -465,16 +557,33 @@ int main(int argc, char** argv) {
 
     const std::string config = usage["config"] ? usage["config"].stringValue() : "tcpredir";
 
+    // Command-line redirects take over completely: no UCI file is read, and
+    // SIGHUP has nothing to re-read, so it only restarts the same listeners.
+    const std::vector<std::string> specs = usage.remainder();
+    const bool argv_mode = !specs.empty();
+    if (argv_mode && usage["config"]) {
+        logger::error << "--config and command-line redirects are mutually exclusive" << std::endl;
+        return 2;
+    }
+
+    const int connect_timeout = usage["connect-timeout"] ? (int)usage["connect-timeout"].intValue() : 10;
+    const int idle_timeout    = usage["idle-timeout"]    ? (int)usage["idle-timeout"].intValue()    : 300;
+    const int udp_timeout     = usage["udp-timeout"]     ? (int)usage["udp-timeout"].intValue()     : 5;
+    const int max_connections = usage["max-connections"] ? (int)usage["max-connections"].intValue() : 0;
+
     while (!stop_requested) {
         try {
-            run_config(config);
+            if (argv_mode)
+                run_redirects(load_specs(specs, generation.load(), connect_timeout, idle_timeout, udp_timeout, max_connections));
+            else
+                run_config(config);
         } catch (const std::exception& e) {
             logger::error << e.what() << std::endl;
             return 1;
         }
 
         if (reload_requested && !stop_requested) {
-            logger::notice << "reloading configuration" << std::endl;
+            logger::notice << ( argv_mode ? "restarting listeners" : "reloading configuration" ) << std::endl;
             reload_requested = 0;
             generation.fetch_add(1);
             continue;
