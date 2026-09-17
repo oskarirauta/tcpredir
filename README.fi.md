@@ -9,6 +9,7 @@ TCP on ohjelman ensisijainen käyttötapa. UDP-tuki on mukana yksinkertaisena re
 ## Ominaisuudet
 
 - Useita samanaikaisia `redirect`-sääntöjä samasta UCI-konfiguraatiosta.
+- Ohjaukset voi antaa myös suoraan komentoriviargumentteina, ilman konfiguraatiotiedostoa.
 - TCP-tunnelointi molempiin suuntiin.
 - Yksinkertainen UDP request/reply -välitys.
 - IPv4/IPv6-nimiresoluutio `getaddrinfo()`-rajapinnalla.
@@ -40,17 +41,21 @@ Tai käytä OpenWrt SDK:n exporttaamia toolchain-muuttujia.
 ## Käyttö
 
 ```sh
-./tcpredir [options]
+./tcpredir [options] [<redirect>...]
 ```
 
 Optiot:
 
 ```text
--c, --config <file>   UCI-konfiguraation nimi tai polku, oletus: tcpredir
--V, --verbose         Verbose-lokitus
--q, --quiet           Vain virheet
--h, --help            Näytä ohje
--v, --version         Näytä versio
+-c, --config <file>       UCI-konfiguraation nimi tai polku, oletus: tcpredir
+    --connect-timeout <s> komentoriviohjaukset: yhteyden aikakatkaisu (oletus 10)
+    --idle-timeout <s>    komentoriviohjaukset: jouten-aikakatkaisu (oletus 300)
+    --udp-timeout <s>     komentoriviohjaukset: UDP-vastauksen aikakatkaisu (oletus 5)
+    --max-connections <n> komentoriviohjaukset: rinnakkaiset yhteydet, 0 = rajoittamaton
+-V, --verbose             Verbose-lokitus
+-q, --quiet               Vain virheet
+-h, --help                Näytä ohje
+-v, --version             Näytä versio
 ```
 
 Jos `--config` on pelkkä nimi, esimerkiksi `tcpredir`, UCI-kirjasto etsii tiedoston OpenWrt-tyyliin `/etc/config/tcpredir`. Jos arvossa on `/`, sitä käytetään polkuna sellaisenaan.
@@ -60,6 +65,31 @@ Esimerkki:
 ```sh
 ./tcpredir -c /etc/config/tcpredir
 ```
+
+### Ohjaukset komentoriviltä
+
+Ohjaukset voi antaa myös argumentteina, jolloin konfiguraatiotiedostoa ei lueta lainkaan:
+
+```sh
+./tcpredir 1080:10.0.0.99:80
+./tcpredir 127.0.0.1:8443:10.0.0.99:443/tcp 1053:1.1.1.1:53/udp
+```
+
+Muoto on:
+
+```text
+[listen_ip:]listen_port:target_ip:target_port[/proto]
+```
+
+`listen_ip` on oletuksena `0.0.0.0` ja `proto` on oletuksena `tcp`. IPv6-osoitteet on kirjoitettava hakasulkeisiin, jotta niiden kaksoispisteitä ei tulkita kenttäerottimiksi:
+
+```sh
+./tcpredir '[::1]:1080:[fd00::2]:80'
+```
+
+Tämä tila on tarkoitettu valvojalle, joka jo tietää osoitteen ja portin jonka haluaa julkaista – esimerkiksi konttien hallintaohjelmalle – jotta se voi käynnistää ohjauksen ilman generoitua konfiguraatiotiedostoa, jota kaksi ohjelmaa sitten omistaisi. `--config` ja komentoriviohjaukset ovat toisensa poissulkevia. `SIGHUP`:lla ei ole tässä tilassa mitään luettavaa uudelleen, joten se vain käynnistää kuuntelijat uudelleen.
+
+**Ohjaus on userspace-proxy, ei palomuurisääntö.** `tcpredir` avaa yhteyden kohteeseen itse, joten kohde näkee asiakkaana *sen* osoitteen – ei alkuperäistä. Palvelut jotka kirjaavat asiakkaiden osoitteita tai tekevät niiden perusteella päätöksiä (pääsysäännöt, rajoitukset, paikannus) näkevät ohjaimen. Kun sillä on merkitystä, käytä palomuurin ohjausta (`fw4` / nftables DNAT), joka kirjoittaa paketin uudelleen ja säilyttää lähdeosoitteen, tai protokollaa joka kuljettaa alkuperäisen osoitteen mukanaan (PROXY protocol).
 
 ## Konfiguraatio
 

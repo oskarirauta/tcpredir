@@ -11,6 +11,7 @@ Finnish documentation is available in [`README.fi.md`](README.fi.md).
 ## Features
 
 - Multiple simultaneous `redirect` rules from the same UCI configuration.
+- Redirects can also be given directly as command-line arguments, with no configuration file.
 - Bidirectional TCP tunneling.
 - Simple UDP request/reply forwarding.
 - IPv4/IPv6 name resolution through `getaddrinfo()`.
@@ -42,17 +43,21 @@ Alternatively, use the toolchain variables exported by the OpenWrt SDK.
 ## Usage
 
 ```sh
-./tcpredir [options]
+./tcpredir [options] [<redirect>...]
 ```
 
 Options:
 
 ```text
--c, --config <file>   UCI configuration name or path, default: tcpredir
--V, --verbose         Verbose logging
--q, --quiet           Errors only
--h, --help            Show help
--v, --version         Show version
+-c, --config <file>       UCI configuration name or path, default: tcpredir
+    --connect-timeout <s> command-line redirects: connect timeout (default 10)
+    --idle-timeout <s>    command-line redirects: idle timeout (default 300)
+    --udp-timeout <s>     command-line redirects: UDP reply timeout (default 5)
+    --max-connections <n> command-line redirects: concurrent connections, 0 = unlimited
+-V, --verbose             Verbose logging
+-q, --quiet               Errors only
+-h, --help                Show help
+-v, --version             Show version
 ```
 
 If `--config` is a plain name, such as `tcpredir`, the UCI library resolves it in the OpenWrt style as `/etc/config/tcpredir`. If the value contains `/`, it is used as a path as-is.
@@ -62,6 +67,31 @@ Example:
 ```sh
 ./tcpredir -c /etc/config/tcpredir
 ```
+
+### Redirects on the command line
+
+Redirects can also be given as arguments, in which case no configuration file is read:
+
+```sh
+./tcpredir 1080:10.0.0.99:80
+./tcpredir 127.0.0.1:8443:10.0.0.99:443/tcp 1053:1.1.1.1:53/udp
+```
+
+The format is:
+
+```text
+[listen_ip:]listen_port:target_ip:target_port[/proto]
+```
+
+`listen_ip` defaults to `0.0.0.0` and `proto` to `tcp`. IPv6 literals must be bracketed so their colons are not read as field separators:
+
+```sh
+./tcpredir '[::1]:1080:[fd00::2]:80'
+```
+
+This mode exists for a supervisor that already knows the address and port it wants published - a container manager, for instance - so it can start a redirector without generating a configuration file that two programs would then both own. `--config` and command-line redirects are mutually exclusive. `SIGHUP` has nothing to re-read here, so it simply restarts the listeners.
+
+**A redirect is a userspace proxy, not a firewall rule.** The connection to the target is opened by `tcpredir`, so the target sees *its* address as the client - not the original one. Services that log client addresses or make decisions based on them (access rules, rate limits, geolocation) will see the redirector instead. Where that matters, use a firewall redirect (`fw4` / nftables DNAT), which rewrites the packet and preserves the source address, or a protocol that carries the original address such as PROXY protocol.
 
 ## Configuration
 
