@@ -23,7 +23,7 @@
 namespace {
 
 constexpr const char* APP_NAME = "tcpredir";
-constexpr const char* APP_VERSION = "1.0.0";
+constexpr const char* APP_VERSION = "1.0.1";
 constexpr int BUFFER_SIZE = 16384;
 constexpr int POLL_TICK_MS = 1000;
 
