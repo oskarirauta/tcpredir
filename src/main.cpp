@@ -19,11 +19,10 @@
 #include "logger.hpp"
 #include "uci.hpp"
 #include "usage.hpp"
+#include "version.hpp"
 
 namespace {
 
-constexpr const char* APP_NAME = "tcpredir";
-constexpr const char* APP_VERSION = "1.1.0";
 constexpr int BUFFER_SIZE = 16384;
 constexpr int POLL_TICK_MS = 1000;
 
