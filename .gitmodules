@@ -19,3 +19,6 @@
 [submodule "rva"]
 	path = rva
 	url = https://github.com/codeinred/recursive-variant
+[submodule "ubus"]
+	path = ubus
+	url = https://github.com/oskarirauta/ubus_cpp.git
