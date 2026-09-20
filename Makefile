@@ -33,7 +33,12 @@ world: tcpredir
 $(shell mkdir -p objs)
 
 objs/main.o: src/main.cpp
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<;
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -MMD -MP -c -o $@ $<;
+
+# Without this, main.o depends on main.cpp alone: editing version.hpp (or any
+# other header) leaves a stale object behind, and the build quietly produces a
+# binary that reports the previous version.
+-include objs/main.d
 
 tcpredir: $(COMMON_OBJS) $(LOGGER_OBJS) $(USAGE_OBJS) $(JSON_OBJS) $(UCI_OBJS) $(UBUS_OBJS) $(OBJS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) $(LIBS) $^ -o $@;
