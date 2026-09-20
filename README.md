@@ -6,8 +6,6 @@
 
 TCP is the primary use case. UDP support is included as a simple request/reply forwarder.
 
-Finnish documentation is available in [`README.fi.md`](README.fi.md).
-
 ## Features
 
 - Multiple simultaneous `redirect` rules from the same UCI configuration.
