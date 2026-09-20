@@ -44,12 +44,8 @@ volatile std::sig_atomic_t reload_requested = 0;
 std::mutex log_mutex;
 #define LOG(stmt) do { const std::lock_guard<std::mutex> _lk(log_mutex); stmt; } while (0)
 
-// The redirects currently being served. Owned by the MAIN thread: it builds the
-// vector, hands copies to the listener threads, and is also the thread the ubus
-// callbacks run on (uloop is single-threaded), so `list` can read it without a
-// lock. The per-redirect connection counter is a shared atomic, so a count read
-// here while a worker thread updates it is well-defined.
-std::vector<struct redirect_t>* active_redirects = nullptr;
+// The redirects currently being served, and the listener threads serving them.
+// Defined after redirect_t below, which it contains.
 bool active_from_config = false;          // config file, as opposed to the command line
 std::string active_config_name;
 std::atomic<unsigned long> generation{1};
@@ -68,8 +64,29 @@ struct redirect_t {
     int udp_timeout = 5;
     int max_connections = 0; // 0 = unlimited
     unsigned long generation = 0;
+    // Shared with every thread serving this redirect (the listener, and each
+    // connection), because they all hold copies of the struct. Set it and they
+    // wind down within one poll tick, leaving other redirects untouched.
+    std::shared_ptr<std::atomic<bool>> stop = std::make_shared<std::atomic<bool>>(false);
     std::shared_ptr<std::atomic<int>> active_connections = std::make_shared<std::atomic<int>>(0);
 };
+
+// A redirect used to be stoppable only by bumping a global generation counter,
+// which meant every change - adding one redirect, removing another - tore down
+// ALL of them and dropped every connection in flight. Each redirect now carries
+// its own stop flag, so listeners can be started and stopped one at a time,
+// which is what the ubus write methods need.
+//
+// The registry is shared: ubus callbacks (uloop, main thread) read it while
+// listener threads run, so it is guarded. Listener threads never touch it
+// themselves - only the main thread adds and removes - but a reader must still
+// not walk the vector while it is being resized.
+struct listener_t {
+    redirect_t r;
+    std::vector<std::thread> threads;
+};
+std::mutex registry_mutex;
+std::vector<std::shared_ptr<listener_t>> registry;   // guarded by registry_mutex
 
 void on_stop_signal(int) {
     stop_requested = 1;
@@ -80,7 +97,7 @@ void on_reload_signal(int) {
 }
 
 bool should_stop(const redirect_t& r) {
-    return stop_requested || reload_requested || generation.load() != r.generation;
+    return stop_requested || r.stop->load();
 }
 
 void close_fd(int& fd) {
@@ -513,8 +530,10 @@ void udp_listener(redirect_t r) {
 // guessing which is which from a flat list.
 void ubus_list(const std::string&, const JSON&, JSON& res) {
     JSON arr = JSON::Array();
-    if (active_redirects) {
-        for (const auto& r : *active_redirects) {
+    {
+        const std::lock_guard<std::mutex> lk(registry_mutex);
+        for (const auto& l : registry) {
+            const redirect_t& r = l->r;
             JSON o = JSON::Object();
             o["name"] = r.name;
             o["proto"] = r.tcp && r.udp ? "both" : (r.udp ? "udp" : "tcp");
@@ -541,39 +560,57 @@ std::vector<ubus::method> ubus_methods() {
     };
 }
 
-void run_redirects(std::vector<redirect_t> redirects) {
-    std::vector<std::thread> threads;
-
-    for (const auto& r : redirects) {
-        if (r.tcp) threads.emplace_back(tcp_listener, r);
-        if (r.udp) threads.emplace_back(udp_listener, r);
-    }
-
-    // The main thread runs uloop so ubus can be served from it; the listeners do
-    // the actual forwarding in their own threads. A short periodic task is what
-    // notices the signal flags, because a signal cannot safely do more than set
-    // one - and it ends uloop, which is how we fall through to the join below.
-    active_redirects = &redirects;
-    uloop::task::add([]() -> int {
-        if (stop_requested || reload_requested) { uloop::exit(); return 0; }
-        return 200;
-    }, 200);
-    uloop::run();
-    active_redirects = nullptr;
-
-    for (auto& t : threads)
-        if (t.joinable()) t.join();
+// Start one redirect's listeners and register it. Main thread only.
+void start_listener(const redirect_t& r) {
+    auto l = std::make_shared<listener_t>();
+    l->r = r;
+    if (l->r.tcp) l->threads.emplace_back(tcp_listener, l->r);
+    if (l->r.udp) l->threads.emplace_back(udp_listener, l->r);
+    const std::lock_guard<std::mutex> lk(registry_mutex);
+    registry.push_back(l);
 }
 
-void run_config(const std::string& config) {
-    unsigned long gen = generation.load();
-    auto redirects = load_config(config, gen);
+// Stop one redirect and wait for its threads. Must NOT be called with
+// registry_mutex held: a listener can be mid-log or mid-accept, and joining while
+// holding the registry lock would block every ubus read for as long as that takes.
+void stop_listener(const std::shared_ptr<listener_t>& l) {
+    l->r.stop->store(true);
+    for (auto& t : l->threads)
+        if (t.joinable()) t.join();
+    l->threads.clear();
+}
+
+// Stop everything: take the registry away under the lock, then join outside it.
+void stop_all_listeners() {
+    std::vector<std::shared_ptr<listener_t>> taken;
+    {
+        const std::lock_guard<std::mutex> lk(registry_mutex);
+        taken.swap(registry);
+    }
+    for (auto& l : taken)
+        stop_listener(l);
+}
+
+// Load the redirects a fresh start (or a reload) should serve.
+std::vector<redirect_t> current_redirects(bool argv_mode, const std::string& config,
+                                          const std::vector<std::string>& specs,
+                                          int connect_timeout, int idle_timeout,
+                                          int udp_timeout, int max_connections) {
+    if (argv_mode)
+        return load_specs(specs, generation.load(), connect_timeout, idle_timeout, udp_timeout, max_connections);
+    auto redirects = load_config(config, generation.load());
     if (redirects.empty())
         throw std::runtime_error("no enabled redirects");
     active_from_config = true;
     active_config_name = config;
-    run_redirects(std::move(redirects));
+    return redirects;
 }
+
+void run_redirects(std::vector<redirect_t> redirects) {
+    for (const auto& r : redirects)
+        start_listener(r);
+}
+
 
 } // namespace
 
@@ -664,24 +701,43 @@ int main(int argc, char** argv) {
         srv = nullptr;
     }
 
-    while (!stop_requested) {
-        try {
-            if (argv_mode)
-                run_redirects(load_specs(specs, generation.load(), connect_timeout, idle_timeout, udp_timeout, max_connections));
-            else
-                run_config(config);
-        } catch (const std::exception& e) {
-            logger::error << e.what() << std::endl;
-            return 1;
-        }
+    // One uloop run for the whole lifetime. Reload happens INSIDE it: leaving
+    // uloop and re-entering it dropped the ubus socket from its fd set, so the
+    // object stayed registered with ubusd while the process no longer answered -
+    // every call after the first SIGHUP timed out. Staying in uloop also means a
+    // reload only replaces the listeners, which is the same operation the ubus
+    // write methods will need.
+    try {
+        run_redirects(current_redirects(argv_mode, config, specs,
+                                        connect_timeout, idle_timeout, udp_timeout, max_connections));
+    } catch (const std::exception& e) {
+        logger::error << e.what() << std::endl;
+        delete srv;
+        return 1;
+    }
 
-        if (reload_requested && !stop_requested) {
-            logger::notice << ( argv_mode ? "restarting listeners" : "reloading configuration" ) << std::endl;
+    uloop::task::add([&]() -> int {
+        if (stop_requested) { uloop::exit(); return 0; }
+        if (reload_requested) {
             reload_requested = 0;
             generation.fetch_add(1);
-            continue;
+            logger::notice << ( argv_mode ? "restarting listeners" : "reloading configuration" ) << std::endl;
+            stop_all_listeners();
+            try {
+                run_redirects(current_redirects(argv_mode, config, specs,
+                                                connect_timeout, idle_timeout, udp_timeout, max_connections));
+            } catch (const std::exception& e) {
+                // A bad edit must not take the daemon down with it: say so and keep
+                // running with nothing served, so fixing the file and sending
+                // another HUP is all it takes to recover.
+                logger::error << "reload failed: " << e.what() << std::endl;
+            }
         }
-    }
+        return 200;
+    }, 200);
+    uloop::run();
+
+    stop_all_listeners();
 
     logger::notice << "stopped" << std::endl;
     delete srv;
