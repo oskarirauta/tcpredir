@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <netdb.h>
 #include <poll.h>
 #include <stdexcept>
@@ -19,6 +20,9 @@
 #include "logger.hpp"
 #include "uci.hpp"
 #include "usage.hpp"
+#include "ubus.hpp"
+#include "uloop.hpp"
+#include "json.hpp"
 #include "version.hpp"
 
 namespace {
@@ -28,6 +32,26 @@ constexpr int POLL_TICK_MS = 1000;
 
 volatile std::sig_atomic_t stop_requested = 0;
 volatile std::sig_atomic_t reload_requested = 0;
+
+// logger_cpp keeps one global stream object per level and accumulates the tag and
+// the message in it, so two threads logging at once corrupt each other's state -
+// its internal mutex guards the message store, not the accumulation. uxcd never
+// hits this because it is single-threaded; tcpredir has a listener thread per
+// redirect and a thread per connection, all of which log. Two redirects were
+// enough to abort in std::string::front(). Every log statement reachable from a
+// worker thread goes through LOG(), which holds the lock for the WHOLE statement
+// - not just one <<.
+std::mutex log_mutex;
+#define LOG(stmt) do { const std::lock_guard<std::mutex> _lk(log_mutex); stmt; } while (0)
+
+// The redirects currently being served. Owned by the MAIN thread: it builds the
+// vector, hands copies to the listener threads, and is also the thread the ubus
+// callbacks run on (uloop is single-threaded), so `list` can read it without a
+// lock. The per-redirect connection counter is a shared atomic, so a count read
+// here while a worker thread updates it is well-defined.
+std::vector<struct redirect_t>* active_redirects = nullptr;
+bool active_from_config = false;          // config file, as opposed to the command line
+std::string active_config_name;
 std::atomic<unsigned long> generation{1};
 
 struct redirect_t {
@@ -341,7 +365,7 @@ void proxy_tcp(int client_fd, redirect_t r) {
     int target_fd = -1;
     try {
         target_fd = connect_target(r, SOCK_STREAM);
-        logger::info[r.name] << "tcp client connected -> " << r.target_ip << ':' << r.target_port << std::endl;
+        LOG(logger::info[r.name] << "tcp client connected -> " << r.target_ip << ':' << r.target_port << std::endl);
 
         pollfd fds[2] = {{client_fd, POLLIN, 0}, {target_fd, POLLIN, 0}};
         char buf[BUFFER_SIZE];
@@ -357,7 +381,7 @@ void proxy_tcp(int client_fd, redirect_t r) {
             }
             if (rc == 0) {
                 if (++idle_ticks >= max_idle_ticks) {
-                    logger::verbose[r.name] << "tcp idle timeout" << std::endl;
+                    LOG(logger::verbose[r.name] << "tcp idle timeout" << std::endl);
                     break;
                 }
                 continue;
@@ -375,7 +399,7 @@ void proxy_tcp(int client_fd, redirect_t r) {
             }
         }
     } catch (const std::exception& e) {
-        logger::error[r.name] << e.what() << std::endl;
+        LOG(logger::error[r.name] << e.what() << std::endl);
     }
 done:
     close_fd(client_fd);
@@ -395,7 +419,7 @@ void tcp_listener(redirect_t r) {
             int rc = ::poll(&pfd, 1, POLL_TICK_MS);
             if (rc < 0) {
                 if (errno == EINTR) continue;
-                if (!should_stop(r)) logger::error[r.name] << "poll: " << std::strerror(errno) << std::endl;
+                LOG(if (!should_stop(r)) logger::error[r.name] << "poll: " << std::strerror(errno) << std::endl);
                 continue;
             }
             if (rc == 0 || !(pfd.revents & POLLIN)) continue;
@@ -405,13 +429,13 @@ void tcp_listener(redirect_t r) {
             int client = ::accept(fd, reinterpret_cast<sockaddr*>(&addr), &len);
             if (client < 0) {
                 if (errno == EINTR) continue;
-                if (!should_stop(r)) logger::error[r.name] << "accept: " << std::strerror(errno) << std::endl;
+                LOG(if (!should_stop(r)) logger::error[r.name] << "accept: " << std::strerror(errno) << std::endl);
                 continue;
             }
 
             int active = r.active_connections->load();
             if (r.max_connections > 0 && active >= r.max_connections) {
-                logger::warning[r.name] << "connection limit reached (" << r.max_connections << ")" << std::endl;
+                LOG(logger::warning[r.name] << "connection limit reached (" << r.max_connections << ")" << std::endl);
                 close_fd(client);
                 continue;
             }
@@ -419,7 +443,7 @@ void tcp_listener(redirect_t r) {
             std::thread(proxy_tcp, client, r).detach();
         }
     } catch (const std::exception& e) {
-        logger::error[r.name] << e.what() << std::endl;
+        LOG(logger::error[r.name] << e.what() << std::endl);
         stop_requested = 1;
     }
     close_fd(fd);
@@ -442,7 +466,7 @@ void udp_request(int listen_fd, redirect_t r, std::vector<char> data, sockaddr_s
                          reinterpret_cast<sockaddr*>(&client_addr), client_len);
         }
     } catch (const std::exception& e) {
-        logger::warning[r.name] << e.what() << std::endl;
+        LOG(logger::warning[r.name] << e.what() << std::endl);
     }
     close_fd(target);
 }
@@ -459,7 +483,7 @@ void udp_listener(redirect_t r) {
             int rc = ::poll(&pfd, 1, POLL_TICK_MS);
             if (rc < 0) {
                 if (errno == EINTR) continue;
-                if (!should_stop(r)) logger::error[r.name] << "poll: " << std::strerror(errno) << std::endl;
+                LOG(if (!should_stop(r)) logger::error[r.name] << "poll: " << std::strerror(errno) << std::endl);
                 continue;
             }
             if (rc == 0 || !(pfd.revents & POLLIN)) continue;
@@ -470,17 +494,51 @@ void udp_listener(redirect_t r) {
             ssize_t n = ::recvfrom(fd, buf.data(), buf.size(), 0, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
             if (n < 0) {
                 if (errno == EINTR) continue;
-                if (!should_stop(r)) logger::error[r.name] << "recvfrom: " << std::strerror(errno) << std::endl;
+                LOG(if (!should_stop(r)) logger::error[r.name] << "recvfrom: " << std::strerror(errno) << std::endl);
                 continue;
             }
             buf.resize(static_cast<size_t>(n));
             std::thread(udp_request, fd, r, std::move(buf), client_addr, client_len).detach();
         }
     } catch (const std::exception& e) {
-        logger::error[r.name] << e.what() << std::endl;
+        LOG(logger::error[r.name] << e.what() << std::endl);
         stop_requested = 1;
     }
     close_fd(fd);
+}
+
+// ubus `list`: what this daemon is serving right now. Read-only, and it reports
+// only ITS OWN redirects - a port published by a container manager is that
+// manager's to report, so a UI can show both sources separately instead of
+// guessing which is which from a flat list.
+void ubus_list(const std::string&, const JSON&, JSON& res) {
+    JSON arr = JSON::Array();
+    if (active_redirects) {
+        for (const auto& r : *active_redirects) {
+            JSON o = JSON::Object();
+            o["name"] = r.name;
+            o["proto"] = r.tcp && r.udp ? "both" : (r.udp ? "udp" : "tcp");
+            o["listen_ip"] = r.listen_ip;
+            o["listen_port"] = (long long)r.listen_port;
+            o["target_ip"] = r.target_ip;
+            o["target_port"] = (long long)r.target_port;
+            o["connections"] = (long long)r.active_connections->load();
+            o["max_connections"] = (long long)r.max_connections;
+            o["idle_timeout"] = (long long)r.idle_timeout;
+            o["connect_timeout"] = (long long)r.connect_timeout;
+            arr.append(o);
+        }
+    }
+    res["redirects"] = arr;
+    res["source"] = active_from_config ? "config" : "arguments";
+    if (active_from_config) res["config"] = active_config_name;
+    res["version"] = APP_VERSION;
+}
+
+std::vector<ubus::method> ubus_methods() {
+    return {
+        { .name = "list", .cb = ubus_list }
+    };
 }
 
 void run_redirects(std::vector<redirect_t> redirects) {
@@ -491,8 +549,17 @@ void run_redirects(std::vector<redirect_t> redirects) {
         if (r.udp) threads.emplace_back(udp_listener, r);
     }
 
-    while (!stop_requested && !reload_requested)
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // The main thread runs uloop so ubus can be served from it; the listeners do
+    // the actual forwarding in their own threads. A short periodic task is what
+    // notices the signal flags, because a signal cannot safely do more than set
+    // one - and it ends uloop, which is how we fall through to the join below.
+    active_redirects = &redirects;
+    uloop::task::add([]() -> int {
+        if (stop_requested || reload_requested) { uloop::exit(); return 0; }
+        return 200;
+    }, 200);
+    uloop::run();
+    active_redirects = nullptr;
 
     for (auto& t : threads)
         if (t.joinable()) t.join();
@@ -503,6 +570,8 @@ void run_config(const std::string& config) {
     auto redirects = load_config(config, gen);
     if (redirects.empty())
         throw std::runtime_error("no enabled redirects");
+    active_from_config = true;
+    active_config_name = config;
     run_redirects(std::move(redirects));
 }
 
@@ -570,6 +639,31 @@ int main(int argc, char** argv) {
     const int udp_timeout     = usage["udp-timeout"]     ? (int)usage["udp-timeout"].intValue()     : 5;
     const int max_connections = usage["max-connections"] ? (int)usage["max-connections"].intValue() : 0;
 
+    // ubus is optional: tcpredir forwards perfectly well without it, and it may
+    // start before ubusd is up (or on a system that has none). A failure to
+    // connect or register is a warning, never a reason to stop redirecting.
+    //
+    // Only the CONFIG-mode daemon registers the object. ubusd accepts duplicate
+    // object names without complaint and then routes a call to whichever
+    // instance it likes, so if every process registered, `ubus call tcpredir
+    // list` would answer from a random one - and a supervisor that starts one
+    // tcpredir per job (uxcd publishes a container port that way) would drown
+    // out the administrator's own service. Redirects given as arguments belong
+    // to whoever started the process; that parent reports them, not us.
+    ubus* srv = nullptr;
+    if (argv_mode) {
+        logger::verbose << "command-line redirects: not registering a ubus object "
+                        << "(it belongs to the configured service)" << std::endl;
+    } else try {
+        srv = new ubus();
+        srv->add_object(APP_NAME, ubus_methods());
+        logger::info << "serving ubus object '" << APP_NAME << "'" << std::endl;
+    } catch (const ubus::exception& e) {
+        logger::warning << "ubus unavailable (" << e.what() << ") - redirects run, but cannot be queried" << std::endl;
+        delete srv;
+        srv = nullptr;
+    }
+
     while (!stop_requested) {
         try {
             if (argv_mode)
@@ -590,5 +684,6 @@ int main(int argc, char** argv) {
     }
 
     logger::notice << "stopped" << std::endl;
+    delete srv;
     return 0;
 }
