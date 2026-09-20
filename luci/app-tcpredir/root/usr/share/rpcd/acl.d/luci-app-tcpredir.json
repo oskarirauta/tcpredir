@@ -1,0 +1,21 @@
+{
+	"luci-app-tcpredir": {
+		"description": "Manage tcpredir port redirects",
+		"read": {
+			"ubus": {
+				"tcpredir": [ "list" ],
+				"uxcd": [ "list" ]
+			},
+			"uci": [ "tcpredir" ]
+		},
+		"write": {
+			"ubus": {
+				"tcpredir": [ "add", "remove", "reload" ]
+			},
+			"uci": [ "tcpredir" ],
+			"file": {
+				"/etc/init.d/tcpredir restart": [ "exec" ]
+			}
+		}
+	}
+}

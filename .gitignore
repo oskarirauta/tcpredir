@@ -1,5 +1,7 @@
 # Prerequisites
-*.d
+# Scoped to the build directory: a bare `*.d` also matches directories, and
+# LuCI's acl.d / menu.d are directories.
+objs/*.d
 
 # Compiled Object files
 *.slo
@@ -69,4 +71,7 @@ Testing/
 objs/*.o
 
 #binaries
-tcpredir
+# Anchored: an unanchored `tcpredir` also matches any directory of that name,
+# which silently swallowed luci/.../view/tcpredir/ - the app was ignored, and
+# `git add -A` said nothing.
+/tcpredir

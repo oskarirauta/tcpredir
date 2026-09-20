@@ -1,0 +1,36 @@
+{
+	"admin/network/tcpredir": {
+		"title": "Port Redirects",
+		"order": 70,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-tcpredir" ]
+		}
+	},
+
+	"admin/network/tcpredir/redirects": {
+		"title": "Redirects",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "tcpredir/redirects"
+		},
+		"depends": {
+			"acl": [ "luci-app-tcpredir" ]
+		}
+	},
+
+	"admin/network/tcpredir/status": {
+		"title": "Status",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "tcpredir/status"
+		},
+		"depends": {
+			"acl": [ "luci-app-tcpredir" ]
+		}
+	}
+}
