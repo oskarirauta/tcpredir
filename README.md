@@ -227,22 +227,31 @@ and reports it through `ubus call uxcd list` / `info`. A user interface showing
 "all redirects on this box" therefore reads two sources and labels them, rather
 than trying to work out from one flat list which redirect came from where.
 
-## OpenWrt installation sketch
+## OpenWrt package
 
-Copy the binary and configuration to the device:
+`openwrt/Makefile` builds two packages, and is meant to be dropped into a feed
+(or copied into `package/tcpredir/` in an OpenWrt tree):
+
+* **`tcpredir`** - the daemon, the procd init script, and an empty
+  `/etc/config/tcpredir` marked as a conffile so your redirects survive a
+  sysupgrade. The shipped configuration is deliberately empty: a redirect starts
+  listening the moment the service reads it, so installing a package must not
+  create one. `tcpredir.uci.example` has a filled-in section to copy from.
+* **`luci-app-tcpredir`** - the web interface below, `PKGARCH:=all`, depending on
+  `luci-base` and `tcpredir`.
+
+`PKG_HASH:=skip` and the release tarball URL assume the repository's release
+workflow, which builds the tarball recursively so the vendored C++ libraries
+travel with it.
+
+For testing without a package, copy the pieces to the device by hand:
 
 ```sh
 scp tcpredir root@router:/usr/sbin/tcpredir
 scp tcpredir.uci.example root@router:/etc/config/tcpredir
+scp openwrt.init root@router:/etc/init.d/tcpredir
+ssh root@router '/etc/init.d/tcpredir enable; /etc/init.d/tcpredir start'
 ```
-
-Start it manually for testing:
-
-```sh
-ssh root@router /usr/sbin/tcpredir -c tcpredir
-```
-
-A proper OpenWrt package and init script should be maintained in an OpenWrt package feed if the application is to be installed with `opkg` and managed through `/etc/init.d/tcpredir`.
 
 ## The LuCI application
 
@@ -262,7 +271,7 @@ separate `tcpredir` processes that uxcd starts and supervises; this daemon does
 not own them and removing one here would only have it return the next time the
 container started. If uxcd is not installed the section is simply absent.
 
-Install the files by hand for testing:
+Install `luci-app-tcpredir`, or place the files by hand for testing:
 
 ```sh
 scp -r luci/app-tcpredir/htdocs/* root@router:/www/
@@ -274,23 +283,15 @@ ssh root@router 'rm -f /tmp/luci-indexcache*; /etc/init.d/rpcd restart'
 
 - Each TCP connection gets its own thread. This is simple and sufficient as a starting point for OpenWrt use, but a poll/epoll-based event loop would be better for very large connection counts.
 - UDP support is stateless request/reply forwarding: for each datagram, a target socket is opened, a reply is waited for briefly, and the reply is forwarded back to the original sender. This is suitable for simple DNS-like use cases, but it is not a full UDP NAT/state-table implementation.
-- The program does not daemonize itself and does not provide a pidfile.
+- The program does not daemonize itself and does not provide a pidfile; procd supervises it instead.
 
 ## Development ideas
 
 Useful future additions could include:
 
-1. OpenWrt package directory and init script.
-2. Daemon/pidfile support or procd integration.
-3. Per-rule timeout and buffer settings.
-4. Per-rule connection limits.
-5. A better UDP state table if UDP should become production-grade generic tunneling.
-6. Automated integration tests in the Makefile.
-7. Writing ubus methods (`add`, `remove`, `reload`) so a LuCI application can
-   change redirects at runtime. Worth keeping those **non-persistent** - only the
-   configuration file survives a restart - so there is no need for ownership
-   tracking or lease expiry, which is where this kind of interface usually gets
-   complicated.
+1. Per-rule buffer settings.
+2. A better UDP state table if UDP should become production-grade generic tunneling.
+3. Automated integration tests in the Makefile.
 
 ## License
 
