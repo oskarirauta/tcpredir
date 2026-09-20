@@ -8,8 +8,7 @@ INCLUDES+= \
 	-I./rva/include \
 	-I./tsl/include
 
-LIBS+= \
-	-lubus
+# ubus/Makefile.inc already provides -lubox -lblobmsg_json -lubus, in that order.
 
 OBJS:= \
 	objs/main.o
@@ -30,6 +29,11 @@ include ./ubus/Makefile.inc
 
 world: tcpredir
 
+# Libraries go AFTER the objects. An --as-needed toolchain (Alpine, which the CI
+# builds on) drops a -l that resolves nothing undefined *at the point it appears*,
+# so libs listed first are discarded and every ubus/uloop symbol comes back
+# undefined at the end of the link. GNU ld resolves left to right.
+
 $(shell mkdir -p objs)
 
 objs/main.o: src/main.cpp
@@ -41,7 +45,7 @@ objs/main.o: src/main.cpp
 -include objs/main.d
 
 tcpredir: $(COMMON_OBJS) $(LOGGER_OBJS) $(USAGE_OBJS) $(JSON_OBJS) $(UCI_OBJS) $(UBUS_OBJS) $(OBJS)
-	$(CXX) $(CXXFLAGS) $(LDFLAGS) $(LIBS) $^ -o $@;
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) $^ $(LIBS) -o $@;
 
 .PHONY: clean
 clean:
