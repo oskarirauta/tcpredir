@@ -15,7 +15,7 @@ TCP is the primary use case. UDP support is included as a simple request/reply f
 - IPv4/IPv6 name resolution through `getaddrinfo()`.
 - UCI configuration parsing with `uci_cpp`.
 - Logging with `logger_cpp`.
-- A read-only **ubus** interface (`tcpredir.list`) for querying the live redirects.
+- A **ubus** interface: query the live redirects, and add, remove or reload them at runtime.
 - Help/version/argument handling with `usage_cpp`.
 - No dependency on the netlink library.
 
@@ -179,6 +179,36 @@ ubus is **optional**: failing to reach `ubusd` or to register is logged as a
 warning and nothing else. Redirecting works the same without it, which matters
 because `tcpredir` may well start before `ubusd`, or run on a system that has no
 ubus at all.
+
+### Changing redirects at runtime
+
+```sh
+ubus call tcpredir add '{"redirect":"127.0.0.1:8080:10.0.0.99:80"}'
+ubus call tcpredir remove '{"name":"8080->10.0.0.99:80"}'
+ubus call tcpredir reload
+```
+
+`add` takes a redirect in the same form as the command line and starts it
+immediately; `remove` stops one by the `name` that `list` reports. Neither
+disturbs the other redirects, and connections already in flight through them are
+untouched.
+
+Redirects added this way are **not persistent**. They are gone when the daemon
+restarts, and the configuration file remains the only description of its steady
+state. That is deliberate: nothing owns a lease and nothing expires, so this
+interface needs no ownership tracking or garbage collection to stay correct.
+
+`reload` re-reads the configuration file. It replaces exactly the redirects that
+came **from that file** - stopping and restarting them even if nothing changed,
+because you asked it to - and leaves runtime redirects alone. A container manager
+publishing a port has nothing to do with the administrator editing
+`/etc/config/tcpredir`, and must not lose its redirect because they did.
+`SIGHUP` does the same thing.
+
+For the same reason, `remove` refuses a redirect that came from the file: it
+would return on the next reload, and quietly serving something different from
+what the file says is worse than saying no. `list` reports `"source"` per
+redirect (`config` or `runtime`) so a user interface can tell them apart.
 
 ### Only the configured service registers
 

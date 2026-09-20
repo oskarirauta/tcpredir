@@ -83,6 +83,12 @@ struct redirect_t {
 // not walk the vector while it is being resized.
 struct listener_t {
     redirect_t r;
+    // Where this redirect came from. `reload` means "re-read the configuration
+    // file", so it replaces exactly the redirects that came FROM that file and
+    // leaves anything added through another channel alone - a container manager's
+    // published port has nothing to do with the administrator editing
+    // /etc/config/tcpredir, and must not disappear because they did.
+    bool from_config = false;
     std::vector<std::thread> threads;
 };
 std::mutex registry_mutex;
@@ -524,6 +530,11 @@ void udp_listener(redirect_t r) {
     close_fd(fd);
 }
 
+// Listener lifecycle, defined below: the ubus callbacks are the main callers, so
+// they are declared here rather than moving the definitions above them.
+void start_listener(const redirect_t& r, bool from_config);
+void stop_listener(const std::shared_ptr<listener_t>& l);
+
 // ubus `list`: what this daemon is serving right now. Read-only, and it reports
 // only ITS OWN redirects - a port published by a container manager is that
 // manager's to report, so a UI can show both sources separately instead of
@@ -545,6 +556,7 @@ void ubus_list(const std::string&, const JSON&, JSON& res) {
             o["max_connections"] = (long long)r.max_connections;
             o["idle_timeout"] = (long long)r.idle_timeout;
             o["connect_timeout"] = (long long)r.connect_timeout;
+            o["source"] = l->from_config ? "config" : "runtime";   // what a reload would replace
             arr.append(o);
         }
     }
@@ -554,16 +566,88 @@ void ubus_list(const std::string&, const JSON&, JSON& res) {
     res["version"] = APP_VERSION;
 }
 
+// ubus `add`: start one redirect now, in the same spec form the command line
+// takes. Deliberately NOT persistent - it is gone when the daemon restarts, and
+// a reload does not touch it either. That is what keeps this interface simple:
+// nothing owns a lease, nothing expires, and the configuration file stays the
+// only thing that describes the daemon's steady state.
+void ubus_add(const std::string&, const JSON& req, JSON& res) {
+    if (!req.contains("redirect") || req["redirect"].to_string().empty()) {
+        res["error"] = "add needs 'redirect' ([listen_ip:]listen_port:target_ip:target_port[/proto])";
+        return;
+    }
+    redirect_t r;
+    try {
+        r = parse_spec(req["redirect"].to_string(), 0, generation.load(), 10, 300, 5, 0);
+    } catch (const std::exception& e) {
+        res["error"] = e.what();
+        return;
+    }
+    {   // a second listener on the same address would just fail to bind in a thread
+        const std::lock_guard<std::mutex> lk(registry_mutex);
+        for (const auto& l : registry)
+            if (l->r.listen_ip == r.listen_ip && l->r.listen_port == r.listen_port) {
+                res["error"] = "already listening on " + r.listen_ip + ":" + std::to_string(r.listen_port) +
+                               " (" + l->r.name + ")";
+                return;
+            }
+    }
+    start_listener(r, false);
+    logger::notice << "added redirect " << r.name << " (runtime)" << std::endl;
+    res["name"] = r.name;
+}
+
+// ubus `remove`: stop one runtime redirect. A redirect that came from the
+// configuration file is refused rather than stopped - it would come back on the
+// next reload anyway, and silently running something different from what the file
+// says is worse than saying no.
+void ubus_remove(const std::string&, const JSON& req, JSON& res) {
+    if (!req.contains("name") || req["name"].to_string().empty()) {
+        res["error"] = "remove needs 'name' (see `list`)";
+        return;
+    }
+    const std::string name = req["name"].to_string();
+    std::shared_ptr<listener_t> found;
+    {
+        const std::lock_guard<std::mutex> lk(registry_mutex);
+        for (auto i = registry.begin(); i != registry.end(); ++i) {
+            if ((*i)->r.name != name) continue;
+            if ((*i)->from_config) {
+                res["error"] = "'" + name + "' comes from the configuration file - edit it and reload";
+                return;
+            }
+            found = *i;
+            registry.erase(i);
+            break;
+        }
+    }
+    if (!found) { res["error"] = "no such redirect: " + name; return; }
+    stop_listener(found);                 // outside the lock: this joins threads
+    logger::notice << "removed redirect " << name << std::endl;
+    res["removed"] = name;
+}
+
+// ubus `reload`: the same thing SIGHUP does - re-read the configuration file and
+// replace the redirects that came from it, leaving runtime ones alone.
+void ubus_reload(const std::string&, const JSON&, JSON& res) {
+    reload_requested = 1;
+    res["reloading"] = true;
+}
+
 std::vector<ubus::method> ubus_methods() {
     return {
-        { .name = "list", .cb = ubus_list }
+        { .name = "list", .cb = ubus_list },
+        { .name = "add", .cb = ubus_add, .hints = {{ "redirect", JSON::TYPE::STRING }} },
+        { .name = "remove", .cb = ubus_remove, .hints = {{ "name", JSON::TYPE::STRING }} },
+        { .name = "reload", .cb = ubus_reload }
     };
 }
 
 // Start one redirect's listeners and register it. Main thread only.
-void start_listener(const redirect_t& r) {
+void start_listener(const redirect_t& r, bool from_config) {
     auto l = std::make_shared<listener_t>();
     l->r = r;
+    l->from_config = from_config;
     if (l->r.tcp) l->threads.emplace_back(tcp_listener, l->r);
     if (l->r.udp) l->threads.emplace_back(udp_listener, l->r);
     const std::lock_guard<std::mutex> lk(registry_mutex);
@@ -591,6 +675,23 @@ void stop_all_listeners() {
         stop_listener(l);
 }
 
+// Stop only the redirects that came from the configuration file. Used by reload:
+// the file's redirects are torn down and re-read unconditionally - the user asked
+// for a reload, so they get one even if nothing in the file changed - while
+// redirects from other channels keep serving untouched.
+void stop_config_listeners() {
+    std::vector<std::shared_ptr<listener_t>> taken;
+    {
+        const std::lock_guard<std::mutex> lk(registry_mutex);
+        std::vector<std::shared_ptr<listener_t>> kept;
+        for (auto& l : registry)
+            ( l->from_config ? taken : kept ).push_back(l);
+        registry.swap(kept);
+    }
+    for (auto& l : taken)
+        stop_listener(l);
+}
+
 // Load the redirects a fresh start (or a reload) should serve.
 std::vector<redirect_t> current_redirects(bool argv_mode, const std::string& config,
                                           const std::vector<std::string>& specs,
@@ -606,9 +707,9 @@ std::vector<redirect_t> current_redirects(bool argv_mode, const std::string& con
     return redirects;
 }
 
-void run_redirects(std::vector<redirect_t> redirects) {
+void run_redirects(std::vector<redirect_t> redirects, bool from_config) {
     for (const auto& r : redirects)
-        start_listener(r);
+        start_listener(r, from_config);
 }
 
 
@@ -709,7 +810,7 @@ int main(int argc, char** argv) {
     // write methods will need.
     try {
         run_redirects(current_redirects(argv_mode, config, specs,
-                                        connect_timeout, idle_timeout, udp_timeout, max_connections));
+                                        connect_timeout, idle_timeout, udp_timeout, max_connections), !argv_mode);
     } catch (const std::exception& e) {
         logger::error << e.what() << std::endl;
         delete srv;
@@ -722,10 +823,13 @@ int main(int argc, char** argv) {
             reload_requested = 0;
             generation.fetch_add(1);
             logger::notice << ( argv_mode ? "restarting listeners" : "reloading configuration" ) << std::endl;
-            stop_all_listeners();
+            // Only the file's own redirects are replaced. Anything added through
+            // another channel is not the file's to remove.
+            if (argv_mode) stop_all_listeners();
+            else           stop_config_listeners();
             try {
                 run_redirects(current_redirects(argv_mode, config, specs,
-                                                connect_timeout, idle_timeout, udp_timeout, max_connections));
+                                                connect_timeout, idle_timeout, udp_timeout, max_connections), !argv_mode);
             } catch (const std::exception& e) {
                 // A bad edit must not take the daemon down with it: say so and keep
                 // running with nothing served, so fixing the file and sending
