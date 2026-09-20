@@ -17,6 +17,7 @@ Finnish documentation is available in [`README.fi.md`](README.fi.md).
 - IPv4/IPv6 name resolution through `getaddrinfo()`.
 - UCI configuration parsing with `uci_cpp`.
 - Logging with `logger_cpp`.
+- A read-only **ubus** interface (`tcpredir.list`) for querying the live redirects.
 - Help/version/argument handling with `usage_cpp`.
 - No dependency on the netlink library.
 
@@ -144,6 +145,59 @@ config redirect 'dns'
         option target_port '53'
 ```
 
+## The ubus interface
+
+When redirects come from a configuration file, `tcpredir` registers a `tcpredir`
+object on ubus and answers `list` with what it is serving *right now* - including
+the live connection count, which the configuration file cannot tell you:
+
+```sh
+ubus call tcpredir list
+```
+
+```json
+{
+	"redirects": [
+		{
+			"name": "web",
+			"proto": "tcp",
+			"listen_ip": "127.0.0.1",
+			"listen_port": 18090,
+			"target_ip": "10.0.0.99",
+			"target_port": 80,
+			"connections": 2,
+			"max_connections": 0,
+			"idle_timeout": 300,
+			"connect_timeout": 10
+		}
+	],
+	"source": "config",
+	"config": "tcpredir",
+	"version": "1.1.1"
+}
+```
+
+ubus is **optional**: failing to reach `ubusd` or to register is logged as a
+warning and nothing else. Redirecting works the same without it, which matters
+because `tcpredir` may well start before `ubusd`, or run on a system that has no
+ubus at all.
+
+### Only the configured service registers
+
+A `tcpredir` started with redirects **as arguments** does not register the
+object. This is deliberate. `ubusd` accepts duplicate object names without
+complaint and then routes a call to whichever instance it likes, so if every
+process registered, `ubus call tcpredir list` would answer from a random one -
+and a supervisor that starts one `tcpredir` per job would drown out the
+administrator's own service.
+
+The rule that follows is simple: **redirects given as arguments belong to
+whoever started the process, and that parent reports them.** uxcd, for instance,
+publishes a container's port by running `tcpredir` as its own supervised child,
+and reports it through `ubus call uxcd list` / `info`. A user interface showing
+"all redirects on this box" therefore reads two sources and labels them, rather
+than trying to work out from one flat list which redirect came from where.
+
 ## OpenWrt installation sketch
 
 Copy the binary and configuration to the device:
@@ -177,6 +231,11 @@ Useful future additions could include:
 4. Per-rule connection limits.
 5. A better UDP state table if UDP should become production-grade generic tunneling.
 6. Automated integration tests in the Makefile.
+7. Writing ubus methods (`add`, `remove`, `reload`) so a LuCI application can
+   change redirects at runtime. Worth keeping those **non-persistent** - only the
+   configuration file survives a restart - so there is no need for ownership
+   tracking or lease expiry, which is where this kind of interface usually gets
+   complicated.
 
 ## License
 

@@ -15,6 +15,7 @@ TCP on ohjelman ensisijainen käyttötapa. UDP-tuki on mukana yksinkertaisena re
 - IPv4/IPv6-nimiresoluutio `getaddrinfo()`-rajapinnalla.
 - UCI-konfiguraation luku `uci_cpp`-kirjastolla.
 - Lokitus `logger_cpp`-kirjastolla.
+- Vain luettava **ubus**-rajapinta (`tcpredir.list`) voimassa olevien ohjausten kyselyyn.
 - Help/version/argumenttien käsittely `usage_cpp`-kirjastolla.
 - Ei riippuvuutta netlink-kirjastoon.
 
@@ -142,6 +143,60 @@ config redirect 'dns'
         option target_port '53'
 ```
 
+## ubus-rajapinta
+
+Kun ohjaukset tulevat konfiguraatiotiedostosta, `tcpredir` rekisteröi ubusiin
+`tcpredir`-objektin ja vastaa `list`-kutsuun sillä mitä se juuri nyt palvelee –
+mukaan lukien elossa olevien yhteyksien määrä, jota konfiguraatiotiedostosta ei
+näe:
+
+```sh
+ubus call tcpredir list
+```
+
+```json
+{
+	"redirects": [
+		{
+			"name": "web",
+			"proto": "tcp",
+			"listen_ip": "127.0.0.1",
+			"listen_port": 18090,
+			"target_ip": "10.0.0.99",
+			"target_port": 80,
+			"connections": 2,
+			"max_connections": 0,
+			"idle_timeout": 300,
+			"connect_timeout": 10
+		}
+	],
+	"source": "config",
+	"config": "tcpredir",
+	"version": "1.1.1"
+}
+```
+
+ubus on **valinnainen**: jos `ubusd`:hen ei saada yhteyttä tai rekisteröinti ei
+onnistu, siitä kirjataan varoitus eikä muuta. Ohjaukset toimivat täysin ilman –
+mikä on olennaista, koska `tcpredir` voi hyvin käynnistyä ennen `ubusd`:tä tai
+järjestelmässä jossa ubusia ei ole lainkaan.
+
+### Vain konfiguroitu palvelu rekisteröi
+
+Argumenteilla käynnistetty `tcpredir` **ei** rekisteröi objektia. Tämä on
+tarkoituksellista. `ubusd` hyväksyy päällekkäiset objektinimet valittamatta ja
+reitittää kutsun sitten jollekin instanssille – jos jokainen prosessi
+rekisteröisi, `ubus call tcpredir list` vastaisi sattumanvaraisesti yhdestä
+niistä, ja valvoja joka käynnistää yhden `tcpredir`:in per tehtävä hukuttaisi
+ylläpitäjän oman palvelun alleen.
+
+Sääntö joka tästä seuraa on yksinkertainen: **argumentteina annetut ohjaukset
+kuuluvat sille joka prosessin käynnisti, ja se raportoi ne.** uxcd esimerkiksi
+julkaisee kontin portin ajamalla `tcpredir`:iä omana valvottuna lapsenaan ja
+raportoi sen `ubus call uxcd list` / `info` -kutsuilla. Käyttöliittymä joka
+näyttää "kaikki laatikon ohjaukset" lukee siis kahta lähdettä ja merkitsee ne –
+sen sijaan että yrittäisi päätellä yhdestä listasta mikä tuli mistäkin.
+
 ## OpenWrt-asennusluonnos
 
 Kopioi binääri ja konfiguraatio laitteelle:
@@ -175,6 +230,11 @@ Hyödyllisimmät seuraavat lisäykset olisivat:
 4. Yhteysmäärän rajoitus per sääntö.
 5. Parempi UDP-state-taulu, jos UDP:stä halutaan tuotantokelpoinen yleiskäyttöinen tunnelointi.
 6. Automaattiset integraatiotestit Makefileen.
+7. Kirjoittavat ubus-metodit (`add`, `remove`, `reload`), jotta LuCI-sovellus voi
+   muuttaa ohjauksia ajon aikana. Ne kannattaa pitää **ei-persistoivina** – vain
+   konfiguraatiotiedoston ohjaukset säilyvät uudelleenkäynnistyksen yli – jolloin
+   ei tarvita omistajuuden seurantaa eikä vanhenemislogiikkaa, joihin tämän
+   tyyppinen rajapinta yleensä mutkistuu.
 
 ## Lisenssi
 
