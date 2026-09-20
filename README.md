@@ -16,6 +16,7 @@ TCP is the primary use case. UDP support is included as a simple request/reply f
 - UCI configuration parsing with `uci_cpp`.
 - Logging with `logger_cpp`.
 - A **ubus** interface: query the live redirects, and add, remove or reload them at runtime.
+- A **LuCI application** for editing redirects and watching them run.
 - Help/version/argument handling with `usage_cpp`.
 - No dependency on the netlink library.
 
@@ -242,6 +243,32 @@ ssh root@router /usr/sbin/tcpredir -c tcpredir
 ```
 
 A proper OpenWrt package and init script should be maintained in an OpenWrt package feed if the application is to be installed with `opkg` and managed through `/etc/init.d/tcpredir`.
+
+## The LuCI application
+
+`luci/app-tcpredir/` holds a LuCI interface with two pages under
+**Network -> Port Redirects**:
+
+* **Redirects** edits `/etc/config/tcpredir`. Saving applies the file by calling
+  `reload` rather than restarting the service, so redirects that were added at
+  runtime keep serving and established connections are not dropped.
+* **Status** shows what is actually running, refreshed every few seconds, and can
+  add or remove runtime redirects. Each row says where it came from, because the
+  first thing a reader needs to know is where to go to change it.
+
+The Status page also lists the ports published by [uxcd](https://github.com/oskarirauta/uxcd)
+containers, read-only and in a section of their own. Those are forwarded by
+separate `tcpredir` processes that uxcd starts and supervises; this daemon does
+not own them and removing one here would only have it return the next time the
+container started. If uxcd is not installed the section is simply absent.
+
+Install the files by hand for testing:
+
+```sh
+scp -r luci/app-tcpredir/htdocs/* root@router:/www/
+scp -r luci/app-tcpredir/root/*   root@router:/
+ssh root@router 'rm -f /tmp/luci-indexcache*; /etc/init.d/rpcd restart'
+```
 
 ## Limitations
 
