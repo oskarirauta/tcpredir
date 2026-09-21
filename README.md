@@ -16,7 +16,7 @@ TCP is the primary use case. UDP support is included as a simple request/reply f
 - UCI configuration parsing with `uci_cpp`.
 - Logging with `logger_cpp`.
 - A **ubus** interface: query the live redirects, and add, remove or reload them at runtime.
-- A **LuCI application** for editing redirects and watching them run.
+- A **LuCI application** for editing redirects and watching them run, with a compact port-forwards card on the Status → Overview page.
 - Help/version/argument handling with `usage_cpp`.
 - No dependency on the netlink library.
 

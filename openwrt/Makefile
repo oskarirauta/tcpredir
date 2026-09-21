@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=tcpredir
-PKG_VERSION:=1.2.0
+PKG_VERSION:=1.3.0
 PKG_RELEASE:=1
 
 # The release tarball is built recursively (submodules included) by the repo's
@@ -95,6 +95,10 @@ define Package/luci-app-tcpredir/install
 		$(1)/www/luci-static/resources/view/tcpredir/redirects.js
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/luci/app-tcpredir/htdocs/luci-static/resources/view/tcpredir/status.js \
 		$(1)/www/luci-static/resources/view/tcpredir/status.js
+
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/status/include
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/luci/app-tcpredir/htdocs/luci-static/resources/view/status/include/28_tcpredir.js \
+		$(1)/www/luci-static/resources/view/status/include/28_tcpredir.js
 
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/luci/app-tcpredir/root/usr/share/luci/menu.d/luci-app-tcpredir.json \
